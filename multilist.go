@@ -3,6 +3,7 @@ package multireadlist
 import (
 	"fmt"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -10,24 +11,56 @@ import (
 	"dana-tech.com/wbw/logs"
 )
 
+const (
+	ReadFromNew = iota
+	ReadFromOld
+)
+
+func clean(data interface{}) int {
+	logs.Logger.Warnf("one of reader read too slow")
+	return 1
+}
+
+var senty Element
+
+func init() {
+	senty.valuehandle = clean
+}
+
+var (
+	NoMoreElement = &senty
+)
+
 //一写多重复读队列
 type MultiReadList struct {
 	//前置头,并不存储数据,只有next是指向header的数据.
 	preheader Element
 	last      *Element
+	mutex     sync.Mutex
 	length    int32
+	//强制回收的长度,设为1000吧
+	maxele    int32
+	minele    int32
 	destroyed bool
 }
 
-func NewMultiReadList() *MultiReadList {
+func NewMultiReadList(buffersizemin int32, buffersizemax int32) *MultiReadList {
 
 	mlist := new(MultiReadList)
-
+	mlist.minele = buffersizemin
+	mlist.maxele = buffersizemax
 	go mlist.clean()
 
 	return mlist
 }
-
+func (ml *MultiReadList) Refesh() {
+	ml.mutex.Lock()
+	defer ml.mutex.Unlock()
+	if ml.destroyed {
+		go ml.clean()
+		ml.destroyed = false
+	}
+}
 func (ml *MultiReadList) clean() {
 	defer func() {
 		pani := recover()
@@ -44,38 +77,74 @@ func (ml *MultiReadList) clean() {
 		}
 		if !ml.destroyed {
 			go ml.clean()
+		} else {
+			logs.Logger.Debugf("buffer clean over %d", ml.length)
 		}
+
 	}()
 
 	for !ml.destroyed || ml.length > 0 {
 		//每秒检测一次
 		time.Sleep(time.Second)
-		if ml.length <= 20 && !ml.destroyed {
+		if ml.length <= ml.minele && !ml.destroyed {
 			//长度小于20 则不进行垃圾处理
 			continue
 		} else {
 			//开始回收
 			for {
-				if ml.last.ref == 0 {
-					last := ml.last
-					//检出前一个节点的后一个节点的指针
-					last.pre.next = nil
-					//更新最后一个记录指针
-					ml.last = last.pre
-					eleseq := last.Seq
+				// last handle with mutex for safe
+				ml.mutex.Lock()
 
-					valueseq := last.Clean()
-					logs.Logger.Infof("clean ele seq %d ,length %d,value %d", eleseq, ml.length-1, valueseq)
-					putElement(last)
-
-					atomic.AddInt32(&ml.length, -1)
-
-				} else {
-					logs.Logger.Debugf("clean last ref", ml.last.ref)
+				if ml.last == nil {
+					logs.Logger.Warnf("last nil length %d", ml.length)
+					//清理完了,退出
 					break
 				}
 
-				if ml.length < 20 {
+				if ml.last.ref == 0 {
+					last := ml.last
+					//检出前一个节点的后一个节点的指针
+					if last.pre != nil {
+						last.pre.next = nil
+					}
+					//更新最后一个记录指针
+					ml.last = last.pre
+
+					last.Clean()
+					logs.Logger.Debugf("clean length %d", ml.length-1)
+					putElement(last)
+					atomic.AddInt32(&ml.length, -1)
+					ml.mutex.Unlock()
+				} else {
+					logs.Logger.Debugf("clean last ref %d list len %d", ml.last.ref, ml.length)
+
+					if ml.length > ml.maxele {
+						logs.Logger.Debugf("list len bigger than maxlen")
+						//长度超出最大长度强制回收.
+						//next置为nomoreelement.
+						last := ml.last
+						//检出前一个节点的后一个节点的指针
+						if last.pre != nil {
+							last.pre.next = nil
+							logs.Logger.Debugf("list too long ,last.pre not nil")
+						}
+
+						//更新最后一个记录指针
+						ml.last = last.pre
+
+						//将last的pre置为nomoreele
+						atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(&last.pre)), unsafe.Pointer(NoMoreElement))
+
+						atomic.AddInt32(&ml.length, -1)
+						ml.mutex.Unlock()
+					} else {
+						ml.mutex.Unlock()
+						break
+					}
+
+				}
+
+				if ml.length < ml.minele && !ml.destroyed {
 					break
 				}
 			}
@@ -85,7 +154,6 @@ func (ml *MultiReadList) clean() {
 
 func (ml *MultiReadList) Destory() {
 	ml.destroyed = true
-
 }
 
 func (ml *MultiReadList) PutHeader(ele *Element) {
@@ -130,17 +198,36 @@ func (ml *MultiReadList) getHeader() *Element {
 	return ele
 }
 
+func (ml *MultiReadList) getTail() *Element {
+
+	var ele *Element
+	ml.mutex.Lock()
+	defer ml.mutex.Unlock()
+	elepointer := atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&ml.last)))
+	ele = (*Element)(elepointer)
+	//判断第一个元素是否为空,是空则表示当前没有数据
+	if ele != nil {
+		ele.addRef()
+	}
+
+	return ele
+}
+
 type MultiListReader struct {
 	//当前持有的数据,每次只能持有一个数据
 	element *Element
 	ml      *MultiReadList
+	readpos int
+	//close usage
+	mutex sync.Mutex
 }
 
 //创建一个reader
-func (mr *MultiListReader) NewMultiListReader(ml *MultiReadList) {
+func (mr *MultiListReader) InitMultiListReader(ml *MultiReadList) {
 	mr.ml = ml
 }
 func (mr *MultiListReader) Close() {
+
 	if mr.element != nil {
 		mr.element.releaseRef()
 		mr.element = nil
@@ -148,7 +235,19 @@ func (mr *MultiListReader) Close() {
 
 }
 
+func (mr *MultiListReader) SetReadAttribute(attr int) {
+	mr.readpos = attr
+}
+
+//设置从最老的数据还是读取.
+func (mr *MultiListReader) SetReadFromOld() {
+	mr.element = mr.ml.getTail()
+}
+
 func (mr *MultiListReader) HasMoreData() bool {
+	if mr.element == nil {
+		return false
+	}
 	elepointer := atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&mr.element.pre)))
 	ele := (*Element)(elepointer)
 	if ele == nil {
@@ -158,11 +257,18 @@ func (mr *MultiListReader) HasMoreData() bool {
 	}
 
 }
+
+//默认从最新的数据读取
 func (mr *MultiListReader) Read() *Element {
 
 	if mr.element == nil {
-		logs.Logger.Infof("read header")
-		mr.element = mr.ml.getHeader()
+		if mr.readpos == ReadFromOld {
+			logs.Logger.Debugf("read tail %d", mr.ml.length)
+			mr.element = mr.ml.getTail()
+		} else {
+			logs.Logger.Debugf("read header")
+			mr.element = mr.ml.getHeader()
+		}
 		return mr.element
 	}
 	ele := mr.element
